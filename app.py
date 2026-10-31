@@ -57,15 +57,27 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
 
 # ------------------------------------------------------------------
+# VWAP (रोज़ का, हर दिन 9:15 से reset)
+# ------------------------------------------------------------------
+def vwap(df: pd.DataFrame) -> pd.Series:
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    vol = df["Volume"].fillna(0)
+    idx = df.index.tz_convert(IST) if df.index.tz is not None else df.index
+    day = pd.Series(idx.date, index=df.index)
+    pv = (typical * vol).groupby(day).cumsum()
+    cv = vol.groupby(day).cumsum()
+    return pv / cv.replace(0, float("nan"))
+
+
+# ------------------------------------------------------------------
 # Data download (batch)
 # ------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def download(symbols: tuple, interval: str):
     tickers = [s + ".NS" for s in symbols]
-    period = "5d"
     data = yf.download(
         tickers,
-        period=period,
+        period="5d",
         interval=interval,
         group_by="ticker",
         auto_adjust=False,
@@ -75,79 +87,109 @@ def download(symbols: tuple, interval: str):
     return data
 
 
-def get_close(data, symbol):
+def get_ohlcv(data, symbol):
     t = symbol + ".NS"
     try:
-        df = data[t] if t in data.columns.get_level_values(0) else None
+        if t not in data.columns.get_level_values(0):
+            return None
+        df = data[t][["High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
     except Exception:
         return None
-    if df is None:
-        return None
-    c = df["Close"].dropna()
-    return c if len(c) > 20 else None
+    return df if len(df) > 20 else None
 
 
-def scan(symbols, interval, lookback, drop_running):
+def fmt_time(ts):
+    try:
+        return ts.tz_convert(IST).strftime("%H:%M")
+    except Exception:
+        return str(ts)
+
+
+# ------------------------------------------------------------------
+# SCAN
+# STEP 1: VWAP से side तय  -> Price > VWAP = सिर्फ CE | Price < VWAP = सिर्फ PE
+# STEP 2: उसी side की RSI cross condition देखो
+# ------------------------------------------------------------------
+def scan(symbols, interval, lookback, drop_running, use_vwap):
     data = download(tuple(symbols), interval)
     results = {"CE_40": [], "CE_60": [], "PE_60": [], "PE_40": []}
 
     for sym in symbols:
-        c = get_close(data, sym)
-        if c is None:
+        df = get_ohlcv(data, sym)
+        if df is None:
             continue
         if drop_running:
-            c = c.iloc[:-1]  # चल रही (अधूरी) candle हटाओ
-        if len(c) < 20:
+            df = df.iloc[:-1]  # चल रही (अधूरी) candle हटाओ
+        if len(df) < 20:
             continue
 
+        c = df["Close"]
         r = rsi(c).dropna()
+        vw = vwap(df)
         if len(r) < lookback + 1:
             continue
 
         last_price = float(c.iloc[-1])
+        last_vwap = vw.iloc[-1]
+        if pd.isna(last_vwap):
+            continue
+        last_vwap = float(last_vwap)
         last_rsi = float(r.iloc[-1])
-        candle_time = c.index[-1].tz_convert(IST).strftime("%H:%M") if c.index.tz else str(c.index[-1])
+        candle_time = fmt_time(c.index[-1])
 
-        # पिछले `lookback` candles में cross देखो
+        # ---------- STEP 1: VWAP से side ----------
+        if use_vwap:
+            if last_price > last_vwap:
+                side = "CE"
+            elif last_price < last_vwap:
+                side = "PE"
+            else:
+                continue
+        else:
+            side = "BOTH"
+
+        # ---------- STEP 2: उसी side की RSI condition ----------
         for i in range(1, lookback + 1):
+            ts = r.index[-i]
             prev, cur = float(r.iloc[-i - 1]), float(r.iloc[-i])
-            when = r.index[-i].tz_convert(IST).strftime("%H:%M") if r.index.tz else str(r.index[-i])
 
-            def row(tag):
+            def row():
                 return {
                     "Stock": sym,
                     "Price": round(last_price, 2),
+                    "VWAP": round(last_vwap, 2),
                     "RSI (now)": round(last_rsi, 1),
                     "Prev RSI": round(prev, 1),
                     "Cross RSI": round(cur, 1),
-                    "Cross candle": when,
+                    "Cross candle": fmt_time(ts),
                     "Last candle": candle_time,
                 }
 
-            # CE: नीचे से ऊपर cross
-            if prev < 40 <= cur:
-                results["CE_40"].append(row("CE_40"))
-            if prev < 60 <= cur:
-                results["CE_60"].append(row("CE_60"))
-            # PE: ऊपर से नीचे cross
-            if prev > 60 >= cur:
-                results["PE_60"].append(row("PE_60"))
-            if prev > 40 >= cur:
-                results["PE_40"].append(row("PE_40"))
+            if side in ("CE", "BOTH"):
+                if prev < 40 <= cur:
+                    results["CE_40"].append(row())
+                if prev < 60 <= cur:
+                    results["CE_60"].append(row())
+
+            if side in ("PE", "BOTH"):
+                if prev > 60 >= cur:
+                    results["PE_60"].append(row())
+                if prev > 40 >= cur:
+                    results["PE_40"].append(row())
 
     out = {}
     for k, v in results.items():
-        df = pd.DataFrame(v)
-        if not df.empty:
-            df = df.sort_values("Cross candle", ascending=False).drop_duplicates("Stock")
-        out[k] = df
+        d = pd.DataFrame(v)
+        if not d.empty:
+            d = d.sort_values("Cross candle", ascending=False).drop_duplicates("Stock")
+        out[k] = d
     return out
 
 
 # ------------------------------------------------------------------
 # UI
 # ------------------------------------------------------------------
-st.title("📈 F&O RSI(14) Screener")
+st.title("📈 F&O VWAP + RSI(14) Screener")
 now = datetime.now(IST)
 st.caption(f"अभी: {now.strftime('%d-%b-%Y %H:%M:%S')} IST  |  Data: Yahoo Finance (≈1 मिनट cache, कुछ delay संभव)")
 
@@ -155,6 +197,7 @@ with st.sidebar:
     st.header("Settings")
     lookback = st.slider("पिछली कितनी candles में cross देखें", 1, 5, 1)
     drop_running = st.checkbox("चल रही candle ignore करें (सिर्फ closed candle)", value=True)
+    use_vwap = st.checkbox("VWAP filter (ऊपर = CE, नीचे = PE)", value=True)
     st.write(f"कुल F&O stocks: **{len(FNO_STOCKS)}**")
     if st.button("🔄 Refresh / Scan Now"):
         st.cache_data.clear()
@@ -166,9 +209,9 @@ tabs = st.tabs([f"⏱ {name}" for _, name in TF])
 for tab, (interval, name) in zip(tabs, TF):
     with tab:
         with st.spinner(f"{name} chart scan हो रहा है..."):
-            res = scan(FNO_STOCKS, interval, lookback, drop_running)
+            res = scan(FNO_STOCKS, interval, lookback, drop_running, use_vwap)
 
-        st.subheader(f"🟢 CE Entry — {name}")
+        st.subheader(f"🟢 CE Entry — {name} (Price > VWAP)")
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(f"**RSI 40 को नीचे से cross** ({len(res['CE_40'])})")
@@ -177,7 +220,7 @@ for tab, (interval, name) in zip(tabs, TF):
             st.markdown(f"**RSI 60 को नीचे से cross** ({len(res['CE_60'])})")
             st.dataframe(res["CE_60"], use_container_width=True, hide_index=True)
 
-        st.subheader(f"🔴 PE Entry — {name}")
+        st.subheader(f"🔴 PE Entry — {name} (Price < VWAP)")
         p1, p2 = st.columns(2)
         with p1:
             st.markdown(f"**RSI 60 को ऊपर से cross** ({len(res['PE_60'])})")
